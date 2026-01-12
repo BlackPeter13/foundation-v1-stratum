@@ -24,7 +24,7 @@ const Client = function(options) {
   this.authorized = false;
   this.difficulty = 0;
   this.lastActivity = Date.now();
-  this.remoteAddress = _this.options.socket.remoteAddress;
+  this.remoteAddress = _this.options.remoteAddress;
   this.shares = { valid: 0, invalid: 0 };
   this.socket = _this.options.socket;
 
