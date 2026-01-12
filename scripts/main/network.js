@@ -118,6 +118,7 @@ const Network = function(poolConfig, portalConfig, authorizeFn) {
       subscriptionId: subscriptionId,
       authorizeFn: authorizeFn,
       socket: socket,
+      remoteAddress: socket.remoteAddress,
       algorithm: _this.poolConfig.primary.coin.algorithms.mining,
       asicboost: _this.poolConfig.primary.coin.asicboost,
       banning: _this.poolConfig.banning,
