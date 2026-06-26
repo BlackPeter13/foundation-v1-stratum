@@ -1,7 +1,18 @@
 /*
  *
- * Network (Updated)
+ * Network (Optimized)
  *
+ * Stratum server – handles incoming TCP/TLS connections, manages clients,
+ * bans, and broadcasts mining jobs.
+ *
+ * Emits:
+ *   - 'started' – when all stratum servers are listening
+ *   - 'stopped' – after shutdown
+ *   - 'client.connected' (client) – new client connected
+ *   - 'client.disconnected' (client) – client disconnected
+ *   - 'client.banned' (client) – client was banned
+ *   - 'broadcastTimeout' – when job rebroadcast timeout fires
+ *   - 'log' (severity, message)
  */
 
 const net = require('net');
@@ -12,161 +23,317 @@ const events = require('events');
 const utils = require('./utils');
 const Client = require('./client');
 
-////////////////////////////////////////////////////////////////////////////////
+// -----------------------------------------------------------------------------
 
-/**
- * The actual stratum server.
- * It emits the following Events:
- *   - 'client.connected'(StratumClientInstance) - when a new miner connects
- *   - 'client.disconnected'(StratumClientInstance) - when a miner disconnects. Be aware that the socket cannot be used anymore.
- *   - 'started' - when the server is up and running
- **/
-
-// Main Network Function
 const Network = function(poolConfig, portalConfig, authorizeFn) {
-
   const _this = this;
+
+  // Set max listeners to avoid warnings (many clients connect)
+  this.setMaxListeners(0);
+
   this.poolConfig = poolConfig;
   this.portalConfig = portalConfig;
-  this.bannedIPs = {};
-  this.stratumClients = {};
-  this.stratumServers = {};
+  this.authorizeFn = authorizeFn;
 
-  let rebroadcastTimeout;
-  const subscriptionCounter = utils.subscriptionCounter();
-  const bannedMS = _this.poolConfig.banning.time * 1000;
+  // Use Map for banned IPs (faster lookups)
+  this.bannedIPs = new Map(); // ip -> timestamp (ms)
+  this.stratumClients = new Map(); // subscriptionId -> Client instance
+  this.stratumServers = new Map(); // port -> Server instance
 
-  // Start Stratum Capabilities
-  /* istanbul ignore next */
+  this._rebroadcastTimeout = null;
+  this._cleanupInterval = null;
+  this._destroyed = false;
+
+  // Log helper
+  const emitLog = (severity, message) => {
+    _this.emit('log', severity, message);
+  };
+
+  // Ban duration in ms
+  const bannedMS = this.poolConfig.banning.time * 1000;
+
+  // --------------------------------------------------------------------------
+  //  Server startup
+  // --------------------------------------------------------------------------
   this.setupNetwork = function() {
+    // Periodic cleanup of expired bans
+    this._cleanupInterval = setInterval(() => {
+      this._cleanupBans();
+    }, this.poolConfig.banning.purgeInterval * 1000);
 
-    // Interval to Clear Old Bans from BannedIPs
-    setInterval(() => {
-      Object.keys(_this.bannedIPs).forEach(ip => {
-        const banTime = _this.bannedIPs[ip];
-        if (Date.now() - banTime > _this.poolConfig.banning.time) {
-          delete _this.bannedIPs[ip];
-        }
-      });
-    }, 1000 * _this.poolConfig.banning.purgeInterval);
+    // Start stratum servers
+    const stratumPorts = this.poolConfig.ports.filter(port => port.enabled);
+    if (stratumPorts.length === 0) {
+      emitLog('error', 'No enabled ports configured – server cannot start');
+      return;
+    }
 
-    // Start Individual Stratum Servers
     let serversStarted = 0;
-    const stratumPorts = _this.poolConfig.ports.filter(port => port.enabled);
 
     stratumPorts.forEach((port) => {
       const currentPort = port.port;
 
-      // Define Stratum Options
-      const options = {
-        ...(port.tls && { key: fs.readFileSync(path.join('./certificates', _this.portalConfig.tls.key)) }),
-        ...(port.tls && { cert: fs.readFileSync(path.join('./certificates', _this.portalConfig.tls.cert)) }),
-        allowHalfOpen: false,
+      // Build TLS options if enabled
+      let options = {};
+      if (port.tls) {
+        const keyPath = path.join('./certificates', this.portalConfig.tls.key);
+        const certPath = path.join('./certificates', this.portalConfig.tls.cert);
+        try {
+          options.key = fs.readFileSync(keyPath);
+          options.cert = fs.readFileSync(certPath);
+        } catch (err) {
+          emitLog('error', `Failed to read TLS certificate files: ${err.message}`);
+          return;
+        }
+        // Optional: add CA if provided
+        if (this.portalConfig.tls.ca) {
+          try {
+            options.ca = fs.readFileSync(path.join('./certificates', this.portalConfig.tls.ca));
+          } catch (err) {
+            emitLog('warning', `CA file not found: ${err.message}`);
+          }
+        }
+        options.allowHalfOpen = false;
+      }
+
+      // Create server (TLS or TCP)
+      const callback = (socket) => {
+        _this.handleNewClient(socket);
       };
+      let server;
+      if (port.tls) {
+        server = tls.createServer(options, callback);
+      } else {
+        server = net.createServer(options, callback);
+      }
 
-      // Setup Stratum Server
-      const callback = (socket) => _this.handleNewClient(socket);
-      const server = (port.tls) ? tls.createServer(options, callback) : net.createServer(options, callback);
+      // Handle server errors
+      server.once('error', (err) => {
+        emitLog('error', `Stratum server on port ${currentPort} error: ${err.message}`);
+        // Do not stop the whole pool; log and continue
+      });
 
-      // Setup Server to Listen on Port
-      server.listen(parseInt(currentPort), () => {
+      // Start listening
+      server.listen(parseInt(currentPort, 10), () => {
         serversStarted += 1;
-        if (serversStarted == stratumPorts.length) {
+        emitLog('info', `Stratum server listening on port ${currentPort}${port.tls ? ' (TLS)' : ''}`);
+        if (serversStarted === stratumPorts.length) {
           _this.emit('started');
+          emitLog('info', 'All stratum servers started');
         }
       });
 
-      // Add Server to Record of Current Ports
-      _this.stratumServers[currentPort] = server;
+      // Store server reference
+      this.stratumServers.set(currentPort, server);
     });
   };
 
-  // Stop Stratum Connection
-  this.stopServer = function() {
-    const stratumPorts = _this.poolConfig.ports.filter(port => port.enabled);
-    stratumPorts.forEach((port) => {
-      const currentPort = port.port;
-      const server = _this.stratumServers[currentPort];
-      server.close();
-    });
-    _this.emit('stopped');
-  };
-
-  // Check Regarding Banned Clients
-  this.checkBan = function(client) {
-    if (client.remoteAddress in _this.bannedIPs) {
-      const bannedTime = _this.bannedIPs[client.remoteAddress];
-      const bannedTimeAgo = Date.now() - bannedTime;
-      const timeLeft = bannedMS - bannedTimeAgo;
-      if (timeLeft > 0) {
-        client.socket.destroy();
-        client.emit('kickedBannedIP', timeLeft / 1000 | 0);
-      } else {
-        delete _this.bannedIPs[client.remoteAddress];
-        client.emit('forgaveBannedIP');
+  // --------------------------------------------------------------------------
+  //  Ban cleanup
+  // --------------------------------------------------------------------------
+  this._cleanupBans = function() {
+    const now = Date.now();
+    for (const [ip, banTime] of this.bannedIPs) {
+      if (now - banTime > bannedMS) {
+        this.bannedIPs.delete(ip);
+        emitLog('debug', `Forgave banned IP ${ip}`);
       }
     }
   };
 
-  // Manage New Client Connections
-  this.handleNewClient = function (socket) {
+  // --------------------------------------------------------------------------
+  //  Check if IP is banned
+  // --------------------------------------------------------------------------
+  this.checkBan = function(client) {
+    if (this._destroyed) return;
 
-    // Establish New Stratum Client
+    const ip = client.remoteAddress;
+    if (this.bannedIPs.has(ip)) {
+      const banTime = this.bannedIPs.get(ip);
+      const timeLeft = bannedMS - (Date.now() - banTime);
+      if (timeLeft > 0) {
+        client.emit('kickedBannedIP', Math.floor(timeLeft / 1000));
+        client.destroy();
+        return true;
+      } else {
+        // Ban expired
+        this.bannedIPs.delete(ip);
+        client.emit('forgaveBannedIP');
+        return false;
+      }
+    }
+    return false;
+  };
+
+  // --------------------------------------------------------------------------
+  //  Add IP to ban list
+  // --------------------------------------------------------------------------
+  this.addBannedIP = function(ipAddress) {
+    if (this._destroyed) return;
+    this.bannedIPs.set(ipAddress, Date.now());
+    emitLog('debug', `Banned IP ${ipAddress}`);
+  };
+
+  // --------------------------------------------------------------------------
+  //  Handle new client connection
+  // --------------------------------------------------------------------------
+  this.handleNewClient = function(socket) {
+    if (this._destroyed) {
+      socket.destroy();
+      return;
+    }
+
+    // Enable keep-alive
     socket.setKeepAlive(true);
-    const subscriptionId = subscriptionCounter.next();
+
+    const subscriptionId = utils.subscriptionCounter().next();
     const client = new Client({
       subscriptionId: subscriptionId,
-      authorizeFn: authorizeFn,
+      authorizeFn: this.authorizeFn,
       socket: socket,
-      remoteAddress: socket.remoteAddress,
-      algorithm: _this.poolConfig.primary.coin.algorithms.mining,
-      asicboost: _this.poolConfig.primary.coin.asicboost,
-      banning: _this.poolConfig.banning,
-      connectionTimeout: _this.poolConfig.settings.connectionTimeout,
-      tcpProxyProtocol: _this.poolConfig.settings.tcpProxyProtocol
+      remoteAddress: socket.remoteAddress || 'unknown',
+      algorithm: this.poolConfig.primary.coin.algorithms.mining,
+      asicboost: this.poolConfig.primary.coin.asicboost || false,
+      banning: this.poolConfig.banning,
+      connectionTimeout: this.poolConfig.settings.connectionTimeout || 300,
+      tcpProxyProtocol: this.poolConfig.settings.tcpProxyProtocol || false,
+      debug: this.poolConfig.debug || false,
     });
-    _this.stratumClients[subscriptionId] = client;
 
-    // Manage Client Behaviors
-    _this.emit('client.connected', client);
+    // Store client
+    this.stratumClients.set(subscriptionId, client);
+
+    // Emit connection event
+    this.emit('client.connected', client);
+
+    // Client events
     client.on('socketDisconnect', () => {
-      delete _this.stratumClients[subscriptionId];
-      _this.emit('client.disconnected', client);
+      if (!_this._destroyed) {
+        _this.stratumClients.delete(subscriptionId);
+        _this.emit('client.disconnected', client);
+      }
     });
+
     client.on('checkBan', () => {
       _this.checkBan(client);
     });
-    client.on('triggerBan', () => {
+
+    client.on('triggerBan', (reason) => {
       _this.addBannedIP(client.remoteAddress);
       _this.emit('client.banned', client);
+      emitLog('debug', `Client ${client.getLabel()} banned: ${reason}`);
     });
 
+    // Forward log events from client
+    client.on('log', (severity, message) => {
+      _this.emit('log', severity, `[Client ${client.getLabel()}] ${message}`);
+    });
+
+    // Set up the client (socket handlers)
     client.setupClient();
-    return subscriptionId;
   };
 
-  // Broadcast New Jobs to Clients
-  /* istanbul ignore next */
+  // --------------------------------------------------------------------------
+  //  Broadcast mining jobs to all connected clients
+  // --------------------------------------------------------------------------
   this.broadcastMiningJobs = function(template, cleanJobs) {
-    Object.keys(_this.stratumClients).forEach(clientId => {
-      const client = _this.stratumClients[clientId];
-      const jobParams = template.getJobParams(client, cleanJobs);
-      client.sendMiningJob(jobParams);
-    });
-    clearTimeout(rebroadcastTimeout);
-    rebroadcastTimeout = setTimeout(() => {
-      _this.emit('broadcastTimeout');
-    }, _this.poolConfig.settings.jobRebroadcastTimeout * 1000);
+    if (this._destroyed) return;
+
+    const clients = this.stratumClients;
+    if (clients.size === 0) {
+      // No clients connected, but still keep the timeout for future connections
+      // We'll still set the rebroadcast timer.
+    }
+
+    for (const [, client] of clients) {
+      try {
+        const jobParams = template.getJobParams(client, cleanJobs);
+        client.sendMiningJob(jobParams);
+      } catch (err) {
+        emitLog('error', `Error broadcasting to client: ${err.message}`);
+        // Optionally destroy client if it fails
+      }
+    }
+
+    // Reset rebroadcast timeout
+    if (this._rebroadcastTimeout) {
+      clearTimeout(this._rebroadcastTimeout);
+    }
+    this._rebroadcastTimeout = setTimeout(() => {
+      if (!_this._destroyed) {
+        _this.emit('broadcastTimeout');
+      }
+    }, this.poolConfig.settings.jobRebroadcastTimeout * 1000);
   };
 
-  // Add Banned IP to List of Banned IPs
-  this.addBannedIP = function(ipAddress) {
-    _this.bannedIPs[ipAddress] = Date.now();
+  // --------------------------------------------------------------------------
+  //  Stop all servers
+  // --------------------------------------------------------------------------
+  this.stopServer = function() {
+    if (this._destroyed) return;
+    for (const [port, server] of this.stratumServers) {
+      server.close(() => {
+        emitLog('info', `Closed stratum server on port ${port}`);
+      });
+    }
+    this.stratumServers.clear();
+    this.emit('stopped');
   };
 
-  // Setup Network on Initialization
-  _this.setupNetwork();
+  // --------------------------------------------------------------------------
+  //  Graceful shutdown
+  // --------------------------------------------------------------------------
+  this.shutdown = function(callback) {
+    if (this._destroyed) {
+      if (callback) callback();
+      return;
+    }
+    this._destroyed = true;
+
+    emitLog('info', 'Shutting down network layer...');
+
+    // Clear intervals and timeouts
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
+    if (this._rebroadcastTimeout) {
+      clearTimeout(this._rebroadcastTimeout);
+      this._rebroadcastTimeout = null;
+    }
+
+    // Close all stratum servers
+    for (const [port, server] of this.stratumServers) {
+      server.close(() => {
+        emitLog('debug', `Closed server on port ${port}`);
+      });
+    }
+    this.stratumServers.clear();
+
+    // Destroy all clients
+    for (const [id, client] of this.stratumClients) {
+      try {
+        client.destroy();
+      } catch (e) {}
+    }
+    this.stratumClients.clear();
+
+    // Clear bans
+    this.bannedIPs.clear();
+
+    // Remove all listeners
+    this.removeAllListeners();
+
+    if (callback) callback();
+  };
+
+  // --------------------------------------------------------------------------
+  //  Start the network
+  // --------------------------------------------------------------------------
+  this.setupNetwork();
 };
 
-module.exports = Network;
+// Inherit EventEmitter
 Network.prototype.__proto__ = events.EventEmitter.prototype;
+
+module.exports = Network;
