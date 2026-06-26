@@ -1,7 +1,18 @@
 /*
  *
- * Peer (Updated)
+ * Peer (Optimized)
  *
+ * P2P client that connects to a full node to receive block notifications.
+ * Emits:
+ *   - 'blockFound' (hash) – when a new block is announced
+ *   - 'connected' – when handshake completes
+ *   - 'disconnected' – when the connection drops
+ *   - 'connectionFailed' – when connection fails (e.g., ECONNREFUSED)
+ *   - 'connectionRejected' – when the peer closes the connection unexpectedly
+ *   - 'error' (message) – for other errors
+ *   - 'socketError' (error) – for socket errors
+ *   - 'peerMessage' (message) – for debugging
+ *   - 'sentMessage' (message) – for debugging
  */
 
 const net = require('net');
@@ -9,40 +20,39 @@ const crypto = require('crypto');
 const events = require('events');
 const utils = require('./utils');
 
-////////////////////////////////////////////////////////////////////////////////
+// -----------------------------------------------------------------------------
 
-/**
- * Reads a set amount of bytes from a flowing stream, argument descriptions:
- * - stream to read from, must have data emitter
- * - amount of bytes to read
- * - preRead argument can be used to set start with an existing data buffer
- * - callback returns 1) data buffer and 2) lopped/over-read data
-**/
-
-// Main Peer Function
 const Peer = function(poolConfig) {
-
   const _this = this;
+
+  // Set max listeners to avoid warnings
+  this.setMaxListeners(0);
+
+  this.poolConfig = poolConfig;
+  this._destroyed = false;
+  this._client = null;
+  this._reconnectTimer = null;
+  this._reconnectAttempts = 0;
+  this._verack = false;
+  this._validConnectionConfig = true;
+
+  // Protocol constants
   this.networkServices = Buffer.from('0100000000000000', 'hex');
-  this.emptyNetAddress = Buffer.from('010000000000000000000000000000000000ffff000000000000', 'hex');
+  this.emptyNetAddress = Buffer.from(
+    '010000000000000000000000000000000000ffff000000000000',
+    'hex'
+  );
   this.userAgent = utils.varStringBuffer('/node-stratum/');
   this.blockStartHeight = Buffer.from('00000000', 'hex');
   this.relayTransactions = Buffer.from([false]);
-  this.magic = Buffer.from(poolConfig.settings.testnet ? (
-    poolConfig.primary.coin.testnet.peerMagic) : (
-    poolConfig.primary.coin.mainnet.peerMagic), 'hex');
-  this.magicInt = _this.magic.readUInt32LE(0);
 
-  let client;
-  let verack = poolConfig.settings.verack;
-  let validConnectionConfig = poolConfig.settings.validConnectionConfig;
+  const testnet = poolConfig.settings.testnet || false;
+  const coin = poolConfig.primary.coin;
+  const magicHex = testnet ? coin.testnet.peerMagic : coin.mainnet.peerMagic;
+  this.magic = Buffer.from(magicHex, 'hex');
+  this.magicInt = this.magic.readUInt32LE(0);
 
-  const invCodes = {
-    error: 0,
-    tx: 1,
-    block: 2
-  };
-
+  // Command buffers
   const commands = {
     version: utils.commandStringBuffer('version'),
     inv: utils.commandStringBuffer('inv'),
@@ -50,49 +60,102 @@ const Peer = function(poolConfig) {
     addr: utils.commandStringBuffer('addr'),
     getblocks: utils.commandStringBuffer('getblocks')
   };
+  this._commands = commands;
 
-  // Establish Peer Connection
-  /* istanbul ignore next */
-  this.setupPeer = function() {
-    client = net.connect({
+  // INV codes
+  const invCodes = {
+    error: 0,
+    tx: 1,
+    block: 2
+  };
+  this._invCodes = invCodes;
+
+  // Log helper
+  const emitLog = (severity, message) => {
+    _this.emit('log', severity, message);
+  };
+
+  // --------------------------------------------------------------------------
+  //  Connection management
+  // --------------------------------------------------------------------------
+
+  this._connect = function() {
+    if (_this._destroyed) return;
+
+    _this._client = net.connect({
       host: poolConfig.p2p.host,
       port: poolConfig.p2p.port
     }, () => {
+      _this._reconnectAttempts = 0;
+      _this._verack = false;
+      _this._validConnectionConfig = true;
       _this.sendVersion();
     });
-    client = _this.handleEvents(client);
-    _this.setupMessageParser(client);
-    return client;
-  };
 
-  // Handle Peer Events
-  /* istanbul ignore next */
-  this.handleEvents = function(client) {
-    client.on('error', (e) => {
+    _this._client.on('error', (e) => {
       if (e.code === 'ECONNREFUSED') {
-        validConnectionConfig = false;
+        _this._validConnectionConfig = false;
         _this.emit('connectionFailed');
+        _this._scheduleReconnect();
       } else {
         _this.emit('socketError', e);
+        _this._scheduleReconnect();
       }
     });
-    client.on('close', () => {
-      if (verack) {
-        verack = false;
+
+    _this._client.on('close', () => {
+      if (_this._destroyed) return;
+      if (_this._verack) {
+        _this._verack = false;
         _this.emit('disconnected');
-        _this.setupPeer();
-      } else if (validConnectionConfig) {
+        _this._scheduleReconnect();
+      } else if (_this._validConnectionConfig) {
         _this.emit('connectionRejected');
+        _this._scheduleReconnect();
+      } else {
+        // Already scheduled via error path
       }
     });
-    return client;
+
+    _this.setupMessageParser(_this._client);
   };
 
-  // Read Bytes Functionality
-  /* istanbul ignore next */
+  this._scheduleReconnect = function() {
+    if (_this._destroyed) return;
+    if (_this._reconnectTimer) return; // already scheduled
+
+    const maxAttempts = 10;
+    if (_this._reconnectAttempts >= maxAttempts) {
+      emitLog('error', `P2P reconnect failed after ${maxAttempts} attempts – giving up`);
+      return;
+    }
+
+    const delay = Math.min(1000 * Math.pow(2, _this._reconnectAttempts), 60000);
+    _this._reconnectAttempts++;
+    emitLog('debug', `P2P reconnect attempt ${_this._reconnectAttempts} in ${delay}ms`);
+
+    _this._reconnectTimer = setTimeout(() => {
+      _this._reconnectTimer = null;
+      if (!_this._destroyed) {
+        _this._connect();
+      }
+    }, delay);
+  };
+
+  // --------------------------------------------------------------------------
+  //  Message parser (stream reader)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Read a fixed number of bytes from a stream, handling over-read data.
+   * @param {stream} stream - the socket
+   * @param {number} amount - bytes to read
+   * @param {Buffer|null} preRead - any data already read
+   * @param {Function} callback - (data, lopped) => {}
+   */
   this.readFlowingBytes = function(stream, amount, preRead, callback) {
-    let buff = preRead ? preRead : Buffer.from([]);
-    const readData = function (data) {
+    let buff = preRead || Buffer.alloc(0);
+    const readData = (data) => {
       buff = Buffer.concat([buff, data]);
       if (buff.length >= amount) {
         const returnData = buff.slice(0, amount);
@@ -102,121 +165,174 @@ const Peer = function(poolConfig) {
         stream.once('data', readData);
       }
     };
-    readData(Buffer.from([]));
+    stream.once('data', readData);
   };
 
-  // Establish Peer Message Parser
-  /* istanbul ignore next */
+  // --------------------------------------------------------------------------
+  //  Message parser initialisation
+  // --------------------------------------------------------------------------
+
   this.setupMessageParser = function(client) {
-    const beginReadingMessage = function (preRead) {
+    const beginReadingMessage = (preRead) => {
       _this.readFlowingBytes(client, 24, preRead, (header, lopped) => {
         const msgMagic = header.readUInt32LE(0);
         if (msgMagic !== _this.magicInt) {
-          _this.emit('error', 'bad magic number from peer');
-          while (header.readUInt32LE(0) !== _this.magicInt && header.length >= 4) {
-            header = header.slice(1);
+          // Skip forward until we find a magic byte
+          let offset = 1;
+          while (offset < header.length - 3) {
+            if (header.readUInt32LE(offset) === _this.magicInt) {
+              beginReadingMessage(header.slice(offset));
+              return;
+            }
+            offset++;
           }
-          if (header.readUInt32LE(0) === _this.magicInt) {
-            beginReadingMessage(header);
-          } else {
-            beginReadingMessage(Buffer.from([]));
-          }
+          // No magic found in this chunk – discard and wait for more
+          beginReadingMessage(null);
           return;
         }
+
         const msgCommand = header.slice(4, 16).toString();
         const msgLength = header.readUInt32LE(16);
         const msgChecksum = header.readUInt32LE(20);
-        _this.readFlowingBytes(client, msgLength, lopped, (payload, lopped) => {
-          if (utils.sha256d(payload).readUInt32LE(0) !== msgChecksum) {
-            _this.emit('error', 'bad payload - failed checksum');
+
+        _this.readFlowingBytes(client, msgLength, lopped, (payload, lopped2) => {
+          // Validate checksum
+          const hash = utils.sha256d(payload);
+          if (hash.readUInt32LE(0) !== msgChecksum) {
+            emitLog('error', 'P2P: bad payload – checksum mismatch');
             beginReadingMessage(null);
             return;
           }
-          _this.handleMessage(msgCommand, payload);
-          beginReadingMessage(lopped);
+          _this._handleMessage(msgCommand, payload);
+          beginReadingMessage(lopped2);
         });
       });
     };
     beginReadingMessage(null);
   };
 
-  // Handle Peer Inventory
-  /* istanbul ignore next */
-  this.handleInventory = function(payload) {
+  // --------------------------------------------------------------------------
+  //  Message handling
+  // --------------------------------------------------------------------------
+
+  this._handleInventory = function(payload) {
     let count = payload.readUInt8(0);
     payload = payload.slice(1);
     if (count >= 0xfd) {
       count = payload.readUInt16LE(0);
       payload = payload.slice(2);
     }
+    const invCodes = this._invCodes;
     while (count--) {
-      switch (payload.readUInt32LE(0)) {
-      case invCodes.error:
-        break;
-      case invCodes.tx:
-        break;
-      case invCodes.block:
-        _this.emit('blockFound', payload.slice(4, 36).toString('hex'));
-        break;
+      const type = payload.readUInt32LE(0);
+      const hash = payload.slice(4, 36).toString('hex');
+      if (type === invCodes.block) {
+        this.emit('blockFound', hash);
       }
       payload = payload.slice(36);
     }
   };
 
-  // Handle Peer Messages
-  /* istanbul ignore next */
-  this.handleMessage = function(command, payload) {
-    _this.emit('peerMessage', {command: command, payload: payload});
+  this._handleMessage = function(command, payload) {
+    this.emit('peerMessage', { command, payload });
+    const commands = this._commands;
     switch (command) {
-    case commands.inv.toString():
-      _this.handleInventory(payload);
-      break;
-    case commands.verack.toString():
-      if(!verack) {
-        verack = true;
-        _this.emit('connected');
-      }
-      break;
-    case commands.version.toString():
-      _this.sendMessage(commands.verack, Buffer.alloc(0));
-      break;
-    default:
-      break;
+      case commands.inv.toString():
+        this._handleInventory(payload);
+        break;
+      case commands.verack.toString():
+        if (!this._verack) {
+          this._verack = true;
+          this.emit('connected');
+        }
+        break;
+      case commands.version.toString():
+        this.sendMessage(commands.verack, Buffer.alloc(0));
+        break;
+      default:
+        // ignore other messages
+        break;
     }
   };
 
-  // Broadcast/Send Peer Messages
+  // --------------------------------------------------------------------------
+  //  Sending messages
+  // --------------------------------------------------------------------------
+
   this.sendMessage = function(command, payload) {
+    if (this._destroyed || !this._client || this._client.destroyed) return;
     const message = Buffer.concat([
-      _this.magic,
+      this.magic,
       command,
       utils.packUInt32LE(payload.length),
       utils.sha256d(payload).slice(0, 4),
       payload
     ]);
-    client.write(message);
-    _this.emit('sentMessage', message);
+    try {
+      this._client.write(message);
+      this.emit('sentMessage', message);
+    } catch (e) {
+      this.emit('error', `Failed to send message: ${e.message}`);
+    }
   };
 
-  // Broadcast/Send Peer Version
   this.sendVersion = function() {
+    const protocolVersion = this.poolConfig.settings.protocolVersion || 70015;
+    const timestamp = (Date.now() / 1000) | 0;
     const payload = Buffer.concat([
-      utils.packUInt32LE(poolConfig.settings.protocolVersion),
-      _this.networkServices,
-      utils.packUInt64LE(Date.now() / 1000 | 0),
-      _this.emptyNetAddress,
-      _this.emptyNetAddress,
-      crypto.pseudoRandomBytes(8),
-      _this.userAgent,
-      _this.blockStartHeight,
-      _this.relayTransactions
+      utils.packUInt32LE(protocolVersion),
+      this.networkServices,
+      utils.packUInt64LE(timestamp),
+      this.emptyNetAddress,
+      this.emptyNetAddress,
+      crypto.randomBytes(8),
+      this.userAgent,
+      this.blockStartHeight,
+      this.relayTransactions
     ]);
-    _this.sendMessage(commands.version, payload);
+    this.sendMessage(this._commands.version, payload);
   };
 
-  // Setup Peer on Initialization
-  _this.setupPeer();
+  // --------------------------------------------------------------------------
+  //  Public API
+  // --------------------------------------------------------------------------
+
+  this.setupPeer = function() {
+    this._connect();
+  };
+
+  this.close = function(callback) {
+    if (this._destroyed) {
+      if (callback) callback();
+      return;
+    }
+    this._destroyed = true;
+
+    // Clear reconnect timer
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+
+    // Close socket
+    if (this._client && !this._client.destroyed) {
+      try {
+        this._client.destroy();
+      } catch (e) {}
+    }
+    this._client = null;
+
+    // Remove all listeners to prevent leaks
+    this.removeAllListeners();
+    if (callback) callback();
+  };
+
+  // --------------------------------------------------------------------------
+  //  Initialise
+  // --------------------------------------------------------------------------
+  this.setupPeer();
 };
 
-module.exports = Peer;
 Peer.prototype.__proto__ = events.EventEmitter.prototype;
+
+module.exports = Peer;
