@@ -1,94 +1,156 @@
 /*
  *
- * Daemon (Updated)
+ * Daemon (Optimized)
  *
+ * Interface to coin daemon RPC. Supports multiple daemons, retries, and connection health tracking.
  */
 
 const http = require('http');
 const events = require('events');
 const async = require('async');
 
-////////////////////////////////////////////////////////////////////////////////
+// -----------------------------------------------------------------------------
 
-/**
- * The Daemon interface interacts with the coin Daemon by using the RPC interface.
- * in order to make it work it needs, as constructor, an array of objects containing
- * - 'host'    : hostname where the coin lives
- * - 'port'    : port where the coin accepts RPC connections
- * - 'user'    : username of the coin for the RPC interface
- * - 'password': password for the RPC interface of the coin
-**/
-
-// Main Daemon Function
 const Daemon = function(daemons, logger) {
-
   const _this = this;
+
+  // Logging function
   this.logger = logger || function(severity, message) {
     console.log(severity + ': ' + message);
   };
 
-  // Configure Daemon HTTP Requests
-  this.performHttpRequest = function(instance, jsonData, callback) {
+  // Internal state
+  this._instances = [];
+  this._requests = []; // pending request objects for abort
+  this._destroyed = false;
+
+  // Status per instance: { online: boolean, lastCheck: timestamp, error: string|null }
+  this._status = new Map();
+
+  // Index and initialize daemons
+  daemons.forEach((daemon, idx) => {
+    daemon.index = idx;
+    daemon.retries = daemon.retries || 2; // default retries per call
+    daemon.timeout = daemon.timeout || 5000; // request timeout in ms
+    this._instances.push(daemon);
+    this._status.set(idx, { online: false, lastCheck: 0, error: null });
+  });
+
+  // --------------------------------------------------------------------------
+  //  HTTP request with timeout and retry
+  // --------------------------------------------------------------------------
+  this.performHttpRequest = function(instance, jsonData, callback, retries, attempt) {
+    if (_this._destroyed) {
+      callback({ type: 'destroyed', message: 'Daemon interface destroyed' }, null);
+      return;
+    }
+
+    attempt = attempt || 0;
+    retries = (retries !== undefined) ? retries : instance.retries;
+
     const options = {
       hostname: instance.host,
       port: instance.port,
       method: 'POST',
-      timeout: 3000,
+      timeout: instance.timeout || 5000,
       headers: { 'Content-Length': jsonData.length },
       auth: instance.username + ':' + instance.password,
     };
 
-    // Attempt to Parse JSON from Response
-    const parseJson = function(res, data) {
-      let dataJson;
-      if ((res.statusCode === 401) || (res.statusCode === 403)) {
-        _this.logger('error', 'Unauthorized RPC access - invalid RPC username or password');
-        callback();
+    let req = null;
+    let timedOut = false;
+    const requestId = Date.now() + Math.random();
+
+    const handleError = (err, type) => {
+      // If we have retries left and it's a recoverable error, retry
+      const recoverable = (type === 'offline' || type === 'timeout' || type === 'request error');
+      if (recoverable && attempt < retries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+        _this.logger('debug', `Daemon ${instance.index} ${type} - retrying in ${delay}ms (attempt ${attempt+1}/${retries})`);
+        setTimeout(() => {
+          _this.performHttpRequest(instance, jsonData, callback, retries, attempt + 1);
+        }, delay);
         return;
       }
-      try {
-        dataJson = JSON.parse(data);
-      } catch(e) {
-        _this.logger('error', 'Could not parse RPC data from daemon instance ' + instance.index
-                    + '\nRequest Data: ' + jsonData
-                    + '\nReponse Data: ' + data);
-        callback();
-        return;
-      }
-      callback(dataJson.error, dataJson, data);
+      // Final failure
+      const errorObj = { type: type || 'unknown', message: err ? err.message : 'Unknown error', instance };
+      _this._status.set(instance.index, { online: false, lastCheck: Date.now(), error: errorObj.message });
+      callback(errorObj, null);
     };
 
-    // Establish HTTP Request
-    const req = http.request(options, (res) => {
+    // Parse response
+    const parseJson = function(res, data) {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        handleError(new Error('Unauthorized - invalid RPC username/password'), 'unauthorized');
+        return;
+      }
+      let dataJson;
+      try {
+        dataJson = JSON.parse(data);
+      } catch (e) {
+        _this.logger('error', `Could not parse RPC data from daemon ${instance.index}: ${data}`);
+        handleError(new Error('Invalid JSON response'), 'parse error');
+        return;
+      }
+      // Update status
+      _this._status.set(instance.index, { online: true, lastCheck: Date.now(), error: null });
+      callback(dataJson.error || null, dataJson, data);
+    };
+
+    // Create request
+    req = http.request(options, (res) => {
       let data = '';
       res.setEncoding('utf8');
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => parseJson(res, data));
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (!timedOut && !_this._destroyed) {
+          parseJson(res, data);
+        }
+      });
     });
 
+    // Store request for potential abort
+    _this._requests.push(req);
+
     req.on('error', (e) => {
+      // Remove from pending
+      const idx = _this._requests.indexOf(req);
+      if (idx !== -1) _this._requests.splice(idx, 1);
+      if (timedOut || _this._destroyed) return;
       if (e.code === 'ECONNREFUSED') {
-        callback({type: 'offline', message: e.message}, null);
+        handleError(e, 'offline');
+      } else if (e.code === 'ETIMEDOUT' || e.code === 'ESOCKETTIMEDOUT') {
+        handleError(e, 'timeout');
       } else {
-        callback({type: 'request error', message: e.message}, null);
+        handleError(e, 'request error');
       }
+    });
+
+    // Timeout handling
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      if (req) {
+        try { req.destroy(); } catch (e) {}
+      }
+      handleError(new Error('Request timeout'), 'timeout');
+    }, options.timeout);
+
+    req.on('close', () => {
+      clearTimeout(timeoutHandle);
     });
 
     req.end(jsonData);
   };
 
-  // Index Daemons from Parameter
-  this.indexDaemons = function(daemons) {
-    daemons.forEach((daemon, idx) => {
-      daemon.index = idx;
-    });
-    return daemons;
-  };
-
-  this.instances = this.indexDaemons(daemons);
-
-  // Check if All Daemons are Online
+  // --------------------------------------------------------------------------
+  //  Check online status (all daemons)
+  // --------------------------------------------------------------------------
   this.isOnline = function(callback) {
+    if (_this._destroyed) {
+      callback(false);
+      return;
+    }
+    // Use a simple command to check all daemons
     this.cmd('getpeerinfo', [], false, (results) => {
       const allOnline = results.every((result) => {
         return !result.error;
@@ -100,20 +162,26 @@ const Daemon = function(daemons, logger) {
     });
   };
 
-  // Initialize Daemons
+  // --------------------------------------------------------------------------
+  //  Initialize daemons (check and emit online)
+  // --------------------------------------------------------------------------
   this.initDaemons = function(callback) {
     this.isOnline((online) => {
       if (online) {
         _this.emit('online');
       }
-      callback(online);
+      if (callback) callback(online);
     });
   };
 
-  // Handle Batch Daemon Commands
+  // --------------------------------------------------------------------------
+  //  Batch command – sends multiple RPC calls to first daemon (no retries)
+  // --------------------------------------------------------------------------
   this.batchCmd = function(requests, callback) {
-
-    // Build JSON Request
+    if (_this._destroyed) {
+      callback({ type: 'destroyed', message: 'Daemon interface destroyed' }, null);
+      return;
+    }
     const requestsJson = [];
     requests.forEach((command, idx) => {
       requestsJson.push({
@@ -122,28 +190,40 @@ const Daemon = function(daemons, logger) {
         id: Date.now() + Math.floor(Math.random() * 10) + idx
       });
     });
-
-    // Make Request to First Daemon
     const serializedRequest = JSON.stringify(requestsJson);
-    _this.performHttpRequest(this.instances[0], serializedRequest, (error, result) => {
+    // Use the first instance, no retries
+    const instance = this._instances[0];
+    if (!instance) {
+      callback(new Error('No daemon instances configured'), null);
+      return;
+    }
+    this.performHttpRequest(instance, serializedRequest, (error, result) => {
       callback(error, result);
-    });
+    }, 0, 0); // no retries
   };
 
-  // Handle Single RPC Command
-  this.cmd = function(method, params, streaming, callback) {
+  // --------------------------------------------------------------------------
+  //  Single RPC command with optional streaming and retries
+  // --------------------------------------------------------------------------
+  this.cmd = function(method, params, streaming, callback, retries) {
+    if (_this._destroyed) {
+      if (callback) callback({ type: 'destroyed', message: 'Daemon interface destroyed' });
+      return;
+    }
+
     let responded = false;
     const results = [];
-
-    // Build JSON Request
     const serializedRequest = JSON.stringify({
       method: method,
       params: params,
       id: Date.now() + Math.floor(Math.random() * 10)
     });
 
-    // Iterate through Daemons Individually
-    async.each(this.instances, (instance, eachCallback) => {
+    // If no retries specified, use each instance's default
+    const useRetries = (retries !== undefined) ? retries : (this._instances[0] ? this._instances[0].retries : 2);
+
+    // Iterate over instances
+    async.each(this._instances, (instance, eachCallback) => {
       _this.performHttpRequest(instance, serializedRequest, (error, result, data) => {
         const returnObj = {
           error: error,
@@ -152,28 +232,85 @@ const Daemon = function(daemons, logger) {
           data: data,
         };
         results.push(returnObj);
+
         if (streaming && !responded) {
           if (!error) {
             responded = true;
             callback(returnObj);
           } else {
-            eachCallback();
+            eachCallback(); // continue to next instance
           }
         } else {
           eachCallback();
         }
-      });
-
-    // Handle Callbacks
+      }, useRetries, 0);
     }, () => {
+      // All instances processed
       if (streaming && !responded) {
-        callback(results[0]);
+        // No success, return first result
+        if (results.length > 0) {
+          callback(results[0]);
+        } else {
+          callback({ error: new Error('No instances available'), instance: null });
+        }
       } else {
         callback(results);
       }
     });
   };
+
+  // --------------------------------------------------------------------------
+  //  Connection status per instance
+  // --------------------------------------------------------------------------
+  this.getConnectionStatus = function() {
+    const status = {};
+    this._instances.forEach((inst) => {
+      const idx = inst.index;
+      const s = this._status.get(idx) || { online: false, lastCheck: 0, error: 'Unknown' };
+      status[idx] = {
+        host: inst.host,
+        port: inst.port,
+        online: s.online,
+        lastCheck: s.lastCheck ? new Date(s.lastCheck).toISOString() : 'never',
+        error: s.error
+      };
+    });
+    return status;
+  };
+
+  // --------------------------------------------------------------------------
+  //  Is at least one daemon connected?
+  // --------------------------------------------------------------------------
+  this.isConnected = function() {
+    for (const [idx, status] of this._status) {
+      if (status.online) return true;
+    }
+    return false;
+  };
+
+  // --------------------------------------------------------------------------
+  //  Graceful shutdown
+  // --------------------------------------------------------------------------
+  this.close = function(callback) {
+    if (_this._destroyed) {
+      if (callback) callback();
+      return;
+    }
+    _this._destroyed = true;
+    // Abort all pending requests
+    _this._requests.forEach((req) => {
+      try {
+        req.destroy();
+      } catch (e) {}
+    });
+    _this._requests = [];
+    _this._status.clear();
+    _this.removeAllListeners();
+    if (callback) callback();
+  };
 };
 
-module.exports = Daemon;
+// Inherit EventEmitter
 Daemon.prototype.__proto__ = events.EventEmitter.prototype;
+
+module.exports = Daemon;
