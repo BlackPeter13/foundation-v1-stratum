@@ -1,7 +1,13 @@
 /*
  *
- * Manager (Updated)
+ * Manager (Optimized)
  *
+ * Manages mining jobs, processes shares, and handles block validation.
+ * Emits:
+ *   - 'newBlock' (template) – when a new block is found
+ *   - 'updatedBlock' (template) – when current block updates
+ *   - 'share' (shareData, auxShareData, blockValid) – for each processed share
+ *   - 'log' (severity, message)
  */
 
 const events = require('events');
@@ -11,101 +17,148 @@ const Algorithms = require('./algorithms');
 const Merkle = require('./merkle');
 const Template = require('./template');
 
-////////////////////////////////////////////////////////////////////////////////
+// -----------------------------------------------------------------------------
 
-// Main Manager Function
 const Manager = function(poolConfig, portalConfig) {
-
   const _this = this;
+
+  // Set max listeners to avoid warnings (many shares can be processed)
+  this.setMaxListeners(0);
+
   this.poolConfig = poolConfig;
   this.portalConfig = portalConfig;
 
-  const algorithm = _this.poolConfig.primary.coin.algorithms.mining;
+  const algorithm = this.poolConfig.primary.coin.algorithms.mining;
   const shareMultiplier = Algorithms[algorithm].multiplier;
   const extraNonceSize = ['kawpow', 'firopow'].includes(algorithm) ? 2 : 4;
 
-  this.currentJob;
+  this.currentJob = null;
   this.validJobs = {};
   this.jobCounter = utils.jobCounter();
-  this.extraNoncePlaceholder = ['kawpow', 'firopow'].includes(algorithm) ? Buffer.from('f000', 'hex') : Buffer.from('f000000ff111111f', 'hex');
+  this.extraNoncePlaceholder = ['kawpow', 'firopow'].includes(algorithm)
+    ? Buffer.from('f000', 'hex')
+    : Buffer.from('f000000ff111111f', 'hex');
   this.extraNonceCounter = utils.extraNonceCounter(extraNonceSize);
-  this.extraNonce2Size = _this.extraNoncePlaceholder.length - _this.extraNonceCounter.size;
+  this.extraNonce2Size = this.extraNoncePlaceholder.length - this.extraNonceCounter.size;
+  this.auxMerkle = null;
 
-  // Build Merkle Tree from Auxiliary Chain
+  // Logging helper
+  const emitLog = (severity, message) => {
+    _this.emit('log', severity, message);
+  };
+
+  // --------------------------------------------------------------------------
+  //  Merkle tree for auxiliary chain
+  // --------------------------------------------------------------------------
   this.buildMerkleTree = function(auxData) {
-    if (auxData) {
-      const merkleData = [Buffer.alloc(32)];
-      const position = utils.getAuxMerklePosition(auxData.chainid, 1);
-      const hash = utils.uint256BufferFromHash(auxData.hash);
+    if (!auxData) return null;
+    const merkleData = [Buffer.alloc(32)];
+    const position = utils.getAuxMerklePosition(auxData.chainid, 1);
+    const hash = utils.uint256BufferFromHash(auxData.hash);
+    if (position < merkleData.length) {
       hash.copy(merkleData[position]);
-      return new Merkle(merkleData);
     }
-    return null;
+    return new Merkle(merkleData);
   };
 
-  // Update Current Managed Job
+  // --------------------------------------------------------------------------
+  //  Update current job (without emitting 'newBlock')
+  // --------------------------------------------------------------------------
   this.updateCurrentJob = function(rpcData) {
-    const auxMerkle = _this.buildMerkleTree(rpcData.auxData);
+    const auxMerkle = this.buildMerkleTree(rpcData.auxData);
     const tmpTemplate = new Template(
-      _this.poolConfig,
+      this.poolConfig,
       Object.assign({}, rpcData),
-      _this.jobCounter.next(),
-      _this.extraNoncePlaceholder,
-      auxMerkle,
+      this.jobCounter.next(),
+      this.extraNoncePlaceholder,
+      auxMerkle
     );
-    _this.currentJob = tmpTemplate;
-    _this.emit('updatedBlock', tmpTemplate);
-    _this.validJobs[tmpTemplate.jobId] = tmpTemplate;
-    _this.auxMerkle = auxMerkle;
+    this.currentJob = tmpTemplate;
+    this.validJobs = {};
+    this.validJobs[tmpTemplate.jobId] = tmpTemplate;
+    this.auxMerkle = auxMerkle;
+    this.emit('updatedBlock', tmpTemplate);
+    emitLog('debug', `Updated current job (height ${tmpTemplate.rpcData.height})`);
   };
 
-  // Check if New Block is Processed
+  // --------------------------------------------------------------------------
+  //  Process new block template – returns true if new block was accepted
+  // --------------------------------------------------------------------------
   this.processTemplate = function(rpcData, processNew) {
-
-    // If Current Job !== Previous Job
-    let isNewBlock = typeof(_this.currentJob) === 'undefined';
-    if ((!isNewBlock && _this.currentJob.rpcData.previousblockhash !== rpcData.previousblockhash) ||
-        (!isNewBlock && _this.currentJob.rpcData.bits !== rpcData.bits)) {
-      isNewBlock = true;
-      if (rpcData.height < _this.currentJob.rpcData.height)
-        isNewBlock = false;
+    // Check if this is a new block (different previous hash or bits)
+    let isNewBlock = typeof(this.currentJob) === 'undefined';
+    if (this.currentJob) {
+      const cur = this.currentJob.rpcData;
+      if (cur.previousblockhash !== rpcData.previousblockhash || cur.bits !== rpcData.bits) {
+        isNewBlock = true;
+        // Guard against reorg: if height is lower, don't process
+        if (rpcData.height < cur.height) {
+          isNewBlock = false;
+          emitLog('warning', `Rejected lower height block: ${rpcData.height} < ${cur.height}`);
+        }
+      }
     }
 
-    // Check for New Block
     if (!isNewBlock && !processNew) {
       return false;
     }
 
-    // Build New Block Template
-    const auxMerkle = _this.buildMerkleTree(rpcData.auxData);
+    // Build new template
+    const auxMerkle = this.buildMerkleTree(rpcData.auxData);
     const tmpTemplate = new Template(
-      _this.poolConfig,
+      this.poolConfig,
       Object.assign({}, rpcData),
-      _this.jobCounter.next(),
-      _this.extraNoncePlaceholder,
-      auxMerkle,
+      this.jobCounter.next(),
+      this.extraNoncePlaceholder,
+      auxMerkle
     );
 
-    // Update Current Template
-    _this.validJobs = {};
-    _this.currentJob = tmpTemplate;
-    _this.emit('newBlock', tmpTemplate);
-    _this.validJobs[tmpTemplate.jobId] = tmpTemplate;
-    _this.auxMerkle = auxMerkle;
+    // Replace current job
+    this.validJobs = {};
+    this.currentJob = tmpTemplate;
+    this.validJobs[tmpTemplate.jobId] = tmpTemplate;
+    this.auxMerkle = auxMerkle;
+
+    this.emit('newBlock', tmpTemplate);
+    emitLog('debug', `New block at height ${tmpTemplate.rpcData.height}`);
     return true;
   };
 
-  // Process Submitted Share
+  // --------------------------------------------------------------------------
+  //  Clean up old jobs (prevent memory leaks)
+  // --------------------------------------------------------------------------
+  this.cleanupJobs = function(maxJobs) {
+    maxJobs = maxJobs || 100;
+    const jobIds = Object.keys(this.validJobs);
+    if (jobIds.length > maxJobs) {
+      // Keep only the most recent maxJobs
+      const sorted = jobIds.sort((a, b) => {
+        // Assuming jobId is incrementing; otherwise we need to compare timestamps
+        // We'll keep the current job and the newest ones
+        return parseInt(a, 10) - parseInt(b, 10);
+      });
+      const toRemove = sorted.slice(0, sorted.length - maxJobs);
+      toRemove.forEach(id => {
+        delete this.validJobs[id];
+      });
+      emitLog('debug', `Cleaned up ${toRemove.length} stale jobs`);
+    }
+  };
+
+  // --------------------------------------------------------------------------
+  //  Process a submitted share
+  // --------------------------------------------------------------------------
   this.processShare = function(
     jobId, previousDifficulty, difficulty, ipAddress, port, addrPrimary,
-    addrAuxiliary, submission) {
-
-    // Main Pool Identifier
+    addrAuxiliary, submission
+  ) {
+    const algorithm = this.poolConfig.primary.coin.algorithms.mining;
+    const shareMultiplier = Algorithms[algorithm].multiplier;
     const identifier = this.portalConfig.identifier || '';
 
-    // Share is Invalid
-    const shareError = function(error) {
-      _this.emit('share', {
+    // Helper to emit a share error
+    const shareError = function(errorCode, message) {
+      const shareData = {
         job: jobId,
         ip: ipAddress,
         port: port,
@@ -113,101 +166,93 @@ const Manager = function(poolConfig, portalConfig) {
         addrAuxiliary: addrAuxiliary,
         difficulty: difficulty,
         identifier: identifier,
-        error: error[1],
-      }, null, false);
-      return { error: error, result: null };
+        error: message,
+      };
+      _this.emit('share', shareData, null, false);
+      return { error: [errorCode, message], result: null };
     };
 
-    // Establish Share Variables
-    let submitTime, job, nTimeInt, blockValid, nTime, version;
-    let extraNonce1Buffer, extraNonce2Buffer, nonceBuffer, mixHashBuffer;
-    let coinbaseBuffer, coinbaseHash, merkleRoot;
+    // Validate job existence
+    const job = this.validJobs[jobId];
+    if (!job || job.jobId !== jobId) {
+      return shareError(21, 'job not found');
+    }
+
+    // Common validation for kawpow/firopow vs others
+    let extraNonce1Buffer, extraNonce2Buffer, nonceBuffer, mixHashBuffer, nTimeInt, version;
     let headerDigest, headerBuffer, headerHash, headerBigNum;
-    let headerHashBuffer, hashOutputBuffer, combinedBuffer, isValid;
-    let shareDiff, blockDiffAdjusted, blockHex, blockHash;
+    let blockValid = false;
+    let blockHex, blockHash, coinbaseBuffer, coinbaseHash, merkleRoot;
+    let shareDiff, blockDiffAdjusted;
     let shareData, auxShareData;
 
-    // Process Submitted Share
-    /* istanbul ignore next */
-    switch (algorithm) {
+    // Algorithm-specific validation and processing
+    if (algorithm === 'kawpow' || algorithm === 'firopow') {
+      // ---- Kawpow/Firopow ----
+      const submitTime = (Date.now() / 1000) | 0;
 
-    // Kawpow/Firopow Share Submission
-    case 'kawpow':
-    case 'firopow':
-
-      // Edge Cases to Check if Share is Invalid
-      submitTime = Date.now() / 1000 | 0;
-      job = _this.validJobs[jobId];
-      if (typeof job === 'undefined' || job.jobId != jobId) {
-        return shareError([21, 'job not found']);
-      }
       if (!utils.isHexString(submission.headerHash)) {
-        return shareError([20, 'invalid header submission [1]']);
+        return shareError(20, 'invalid header submission [1]');
       }
       if (!utils.isHexString(submission.mixHash)) {
-        return shareError([20, 'invalid mixHash submission']);
+        return shareError(20, 'invalid mixHash submission');
       }
       if (!utils.isHexString(submission.nonce)) {
-        return shareError([20, 'invalid nonce submission']);
+        return shareError(20, 'invalid nonce submission');
       }
       if (submission.mixHash.length !== 64) {
-        return shareError([20, 'incorrect size of mixHash']);
+        return shareError(20, 'incorrect size of mixHash');
       }
       if (submission.nonce.length !== 16) {
-        return shareError([20, 'incorrect size of nonce']);
+        return shareError(20, 'incorrect size of nonce');
       }
       if (submission.nonce.indexOf(submission.extraNonce1.substring(0, 4)) !== 0) {
-        return shareError([24, 'nonce out of worker range']);
+        return shareError(24, 'nonce out of worker range');
       }
       if (!addrPrimary && !addrAuxiliary) {
-        return shareError([20, 'worker address isn\'t set properly']);
+        return shareError(20, 'worker address isn\'t set properly');
       }
       if (!job.registerSubmit([submission.extraNonce1, submission.nonce, submission.headerHash, submission.mixHash])) {
-        return shareError([22, 'duplicate share']);
+        return shareError(22, 'duplicate share');
       }
 
-      // Establish Share Information
-      blockValid = false;
+      // Build coinbase and merkle root
       extraNonce1Buffer = Buffer.from(submission.extraNonce1, 'hex');
       nonceBuffer = utils.reverseBuffer(Buffer.from(submission.nonce, 'hex'));
       mixHashBuffer = Buffer.from(submission.mixHash, 'hex');
-
-      // Generate Coinbase Buffer
       coinbaseBuffer = job.serializeCoinbase(extraNonce1Buffer);
       coinbaseHash = job.coinbaseHasher(coinbaseBuffer);
       merkleRoot = job.merkle.withFirst(coinbaseHash);
 
-      // Start Generating Block Hash
+      // Serialize header
       version = job.rpcData.version;
-      nTime = utils.packUInt32BE(job.rpcData.curtime).toString('hex');
+      const nTime = utils.packUInt32BE(job.rpcData.curtime).toString('hex');
       headerDigest = Algorithms[algorithm].hash(_this.poolConfig.primary.coin);
       headerBuffer = job.serializeHeader(merkleRoot, nTime, submission.nonce, version);
-      headerHashBuffer = utils.reverseBuffer(utils.sha256d(headerBuffer));
+      const headerHashBuffer = utils.reverseBuffer(utils.sha256d(headerBuffer));
       headerHash = headerHashBuffer.toString('hex');
 
-      // Check if Generated Header Matches
       if (submission.headerHash !== headerHash) {
-        return shareError([20, 'invalid header submission [2]']);
+        return shareError(20, 'invalid header submission [2]');
       }
 
-      // Check Validity of Solution
-      hashOutputBuffer = Buffer.alloc(32);
-      isValid = headerDigest(headerHashBuffer, nonceBuffer, job.rpcData.height, mixHashBuffer, hashOutputBuffer);
-      headerBigNum = bignum.fromBuffer(hashOutputBuffer, {endian: 'big', size: 32});
+      // Validate solution (Kawpow/Firopow specific)
+      const hashOutputBuffer = Buffer.alloc(32);
+      const isValid = headerDigest(headerHashBuffer, nonceBuffer, job.rpcData.height, mixHashBuffer, hashOutputBuffer);
+      headerBigNum = bignum.fromBuffer(hashOutputBuffer, { endian: 'big', size: 32 });
 
-      // Check if Submission is Valid Solution
       if (!isValid) {
-        return shareError([20, 'submission is not valid']);
+        return shareError(20, 'submission is not valid');
       }
 
-      // Calculate Share Difficulty
+      // Calculate difficulty
       shareDiff = Algorithms[algorithm].diff / headerBigNum.toNumber() * shareMultiplier;
       blockDiffAdjusted = job.difficulty * shareMultiplier;
       blockHex = job.serializeBlock(headerBuffer, coinbaseBuffer, nonceBuffer, mixHashBuffer).toString('hex');
 
-      // Generate Output Block Hash
+      // Generate block hash (different for firopow)
       if (algorithm === 'firopow') {
-        combinedBuffer = Buffer.alloc(120);
+        const combinedBuffer = Buffer.alloc(120);
         headerBuffer.copy(combinedBuffer);
         merkleRoot.copy(combinedBuffer, 36);
         nonceBuffer.copy(combinedBuffer, 80);
@@ -217,7 +262,7 @@ const Manager = function(poolConfig, portalConfig) {
         blockHash = hashOutputBuffer.toString('hex');
       }
 
-      // Check if Share is Valid Block Candidate
+      // Check if valid block candidate
       if (job.target.ge(headerBigNum)) {
         blockValid = true;
       } else {
@@ -225,115 +270,100 @@ const Manager = function(poolConfig, portalConfig) {
           if (previousDifficulty && shareDiff >= previousDifficulty) {
             difficulty = previousDifficulty;
           } else {
-            return shareError([23, 'low difficulty share of ' + shareDiff]);
+            return shareError(23, `low difficulty share of ${shareDiff}`);
           }
         }
       }
 
-      // Build Share Object Data
+      // Build share data
       shareData = {
         job: jobId,
         ip: ipAddress,
         port: port,
-        addrPrimary: addrPrimary,
-        addrAuxiliary: addrAuxiliary,
-        blockDiffPrimary : blockDiffAdjusted,
+        addrPrimary, addrAuxiliary,
+        blockDiffPrimary: blockDiffAdjusted,
         blockType: blockValid ? 'primary' : 'share',
         coinbase: coinbaseBuffer,
-        difficulty: difficulty,
+        difficulty,
         hash: blockHash,
         hex: blockHex,
         header: headerHash,
         headerDiff: headerBigNum,
         height: job.rpcData.height,
-        identifier: identifier,
+        identifier,
         reward: job.rpcData.coinbasevalue,
         shareDiff: shareDiff.toFixed(8),
       };
-
       auxShareData = {
         job: jobId,
         ip: ipAddress,
         port: port,
-        addrPrimary: addrPrimary,
-        addrAuxiliary: addrAuxiliary,
-        blockDiffPrimary : blockDiffAdjusted,
+        addrPrimary, addrAuxiliary,
+        blockDiffPrimary: blockDiffAdjusted,
         blockType: 'auxiliary',
         coinbase: coinbaseBuffer,
-        difficulty: difficulty,
+        difficulty,
         hash: blockHash,
         hex: blockHex,
         header: headerHash,
         headerDiff: headerBigNum,
-        identifier: identifier,
+        identifier,
         shareDiff: shareDiff.toFixed(8),
       };
 
-      _this.emit('share', shareData, auxShareData, blockValid);
-      return { error: null, hash: blockHash, hex: blockHex, result: true };
+    } else {
+      // ---- Default (standard) ----
+      const submitTime = (Date.now() / 1000) | 0;
 
-    // Default Share Submission
-    default:
-
-      // Edge Cases to Check if Share is Invalid
-      submitTime = Date.now() / 1000 | 0;
-      job = _this.validJobs[jobId];
-      if (submission.extraNonce2.length / 2 !== _this.extraNonce2Size)
-        return shareError([20, 'incorrect size of extranonce2']);
-      if (typeof job === 'undefined' || job.jobId != jobId) {
-        return shareError([21, 'job not found']);
+      if (submission.extraNonce2.length / 2 !== this.extraNonce2Size) {
+        return shareError(20, 'incorrect size of extranonce2');
       }
       if (submission.nTime.length !== 8) {
-        return shareError([20, 'incorrect size of ntime']);
+        return shareError(20, 'incorrect size of ntime');
       }
-      nTimeInt = parseInt(submission.nTime, 16);
+      const nTimeInt = parseInt(submission.nTime, 16);
       if (nTimeInt < job.rpcData.curtime || nTimeInt > submitTime + 7200) {
-        return shareError([20, 'ntime out of range']);
+        return shareError(20, 'ntime out of range');
       }
       if (submission.nonce.length !== 8) {
-        return shareError([20, 'incorrect size of nonce']);
+        return shareError(20, 'incorrect size of nonce');
       }
       if (!addrPrimary && !addrAuxiliary) {
-        return shareError([20, 'worker address isn\'t set properly']);
+        return shareError(20, 'worker address isn\'t set properly');
       }
       if (!job.registerSubmit([submission.extraNonce1, submission.extraNonce2, submission.nTime, submission.nonce])) {
-        return shareError([22, 'duplicate share']);
+        return shareError(22, 'duplicate share');
       }
 
-      // Check for asicboost Support
+      // Asicboost version handling
       version = job.rpcData.version;
       if (submission.asicboost && submission.versionBit !== undefined) {
         const vBit = parseInt('0x' + submission.versionBit);
         const vMask = parseInt('0x' + submission.versionMask);
         if ((vBit & ~vMask) !== 0) {
-          return shareError([20, 'invalid version bit']);
+          return shareError(20, 'invalid version bit');
         }
         version = (version & ~vMask) | (vBit & vMask);
       }
 
-      // Establish Share Information
-      blockValid = false;
+      // Build coinbase and merkle root
       extraNonce1Buffer = Buffer.from(submission.extraNonce1, 'hex');
       extraNonce2Buffer = Buffer.from(submission.extraNonce2, 'hex');
-
-      // Generate Coinbase Buffer
       coinbaseBuffer = job.serializeCoinbase(extraNonce1Buffer, extraNonce2Buffer);
       coinbaseHash = job.coinbaseHasher(coinbaseBuffer);
       merkleRoot = job.merkle.withFirst(coinbaseHash);
 
-      // Start Generating Block Hash
+      // Serialize and hash header
       headerDigest = Algorithms[algorithm].hash(_this.poolConfig.primary.coin);
       headerBuffer = job.serializeHeader(merkleRoot, submission.nTime, submission.nonce, version);
       headerHash = headerDigest(headerBuffer, nTimeInt);
-      headerBigNum = bignum.fromBuffer(headerHash, {endian: 'little', size: 32});
+      headerBigNum = bignum.fromBuffer(headerHash, { endian: 'little', size: 32 });
 
-      // Calculate Share Difficulty
       shareDiff = Algorithms[algorithm].diff / headerBigNum.toNumber() * shareMultiplier;
       blockDiffAdjusted = job.difficulty * shareMultiplier;
       blockHex = job.serializeBlock(headerBuffer, coinbaseBuffer, null, null).toString('hex');
       blockHash = job.blockHasher(headerBuffer, submission.nTime).toString('hex');
 
-      // Check if Share is Valid Block Candidate
       if (job.target.ge(headerBigNum)) {
         blockValid = true;
       } else {
@@ -341,55 +371,71 @@ const Manager = function(poolConfig, portalConfig) {
           if (previousDifficulty && shareDiff >= previousDifficulty) {
             difficulty = previousDifficulty;
           } else {
-            return shareError([23, 'low difficulty share of ' + shareDiff]);
+            return shareError(23, `low difficulty share of ${shareDiff}`);
           }
         }
       }
 
-      // Build Share Object Data
       shareData = {
         job: jobId,
         ip: ipAddress,
         port: port,
-        addrPrimary: addrPrimary,
-        addrAuxiliary: addrAuxiliary,
-        blockDiffPrimary : blockDiffAdjusted,
+        addrPrimary, addrAuxiliary,
+        blockDiffPrimary: blockDiffAdjusted,
         blockType: blockValid ? 'primary' : 'share',
         coinbase: coinbaseBuffer,
-        difficulty: difficulty,
+        difficulty,
         hash: blockHash,
         hex: blockHex,
         header: headerHash,
         headerDiff: headerBigNum,
         height: job.rpcData.height,
-        identifier: identifier,
+        identifier,
         reward: job.rpcData.coinbasevalue,
         shareDiff: shareDiff.toFixed(8),
       };
-
       auxShareData = {
         job: jobId,
         ip: ipAddress,
         port: port,
-        addrPrimary: addrPrimary,
-        addrAuxiliary: addrAuxiliary,
-        blockDiffPrimary : blockDiffAdjusted,
+        addrPrimary, addrAuxiliary,
+        blockDiffPrimary: blockDiffAdjusted,
         blockType: 'auxiliary',
         coinbase: coinbaseBuffer,
-        difficulty: difficulty,
+        difficulty,
         hash: blockHash,
         hex: blockHex,
         header: headerHash,
         headerDiff: headerBigNum,
-        identifier: identifier,
+        identifier,
         shareDiff: shareDiff.toFixed(8),
       };
-
-      _this.emit('share', shareData, auxShareData, blockValid);
-      return { error: null, hash: blockHash, hex: blockHex, result: true };
     }
+
+    // Emit share event
+    this.emit('share', shareData, auxShareData, blockValid);
+
+    // Clean up old jobs periodically (every 10 shares to avoid overhead)
+    if (Math.random() < 0.01) { // 1% chance per share
+      this.cleanupJobs(100);
+    }
+
+    return { error: null, hash: blockHash, hex: blockHex, result: true };
+  };
+
+  // --------------------------------------------------------------------------
+  //  Graceful shutdown
+  // --------------------------------------------------------------------------
+  this.shutdown = function() {
+    this.validJobs = {};
+    this.currentJob = null;
+    this.auxMerkle = null;
+    this.removeAllListeners();
+    emitLog('info', 'Manager shut down');
   };
 };
 
-module.exports = Manager;
+// Inherit EventEmitter
 Manager.prototype.__proto__ = events.EventEmitter.prototype;
+
+module.exports = Manager;
